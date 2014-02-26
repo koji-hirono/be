@@ -7,7 +7,7 @@ Feature
 -------
 
 * commands are `ed` like.
-* supoort for big data (>4GB).
+* support for big data (>4GB).
 
 License
 -------
