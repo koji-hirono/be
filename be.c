@@ -33,8 +33,8 @@ enum {
 };
 
 struct Region {
-	uintmax_t from;
-	uintmax_t to;
+	int n;
+	uintmax_t addr[2];
 };
 
 struct Action {
@@ -59,16 +59,18 @@ struct Cmd {
 
 void usage(const char *);
 void env_init(Env *);
+void region_init(Region *);
 int parse(Env *, Stream *);
 int parse_region(Env *, Region *, Stream *);
-int parse_address(Env *, uintmax_t *, Stream *);
+int parse_address(Env *, Region *, Stream *);
 Cmd *cmd_find(int);
 int cmd_change(Env *, Region *, Stream *);
 int cmd_edit(Env *, Region *, Stream *);
-int cmd_search(Env *, Region *, Stream *);
 int cmd_print(Env *, Region *, Stream *);
 int cmd_quit(Env *, Region *, Stream *);
 int cmd_write(Env *, Region *, Stream *);
+int cmd_search(Env *, Region *, Stream *);
+int cmd_print_addr(Env *, Region *, Stream *);
 char *get_fname(Stream *, Buf *);
 void hexdump(Env *, Region *, Stream *);
 int input_data(Buf *, Stream *, int);
@@ -83,6 +85,7 @@ Cmd cmdtbl[] = {
 	{'q', cmd_quit},
 	{'w', cmd_write},
 	{'/', cmd_search},
+	{'=', cmd_print_addr},
 	{'\0', NULL}
 };
 
@@ -156,12 +159,21 @@ env_init(Env *env)
 	env->silent = 0;
 }
 
+void
+region_init(Region *region)
+{
+	region->n = 0;
+	region->addr[0] = 0;
+	region->addr[1] = 0;
+}
+
 int
 parse(Env *env, Stream *s)
 {
 	Region region;
 	Cmd *cmd;
 
+	region_init(&region);
 	if (parse_region(env, &region, s) != 0)
 		return CMD_ERROR;
 
@@ -174,68 +186,108 @@ parse(Env *env, Stream *s)
 int
 parse_region(Env *env, Region *region, Stream *s)
 {
-	if (parse_address(env, &region->from, s) != 0) {
-		region->from = env->cur;
-		region->to = env->cur;
-		return 0;
-	}
+	int c;
 
-	if (region->from > env->end)
+	if (parse_address(env, region, s) != 0)
 		return -1;
 
-	if (stream_peekc(s) == ',') {
-		if (parse_address(env, &region->to, s) != 0)
+	c = stream_peekc(s);
+	if (c == ',') {
+		if (parse_address(env, region, s) != 0)
 			return -1;
+		if (region->n == 1)
+			return -1;
+		if (region->n == 0) {
+			region->addr[0] = 0;
+			region->addr[1] = env->end;
+			region->n = 2;
+			return 0;
+		}
 
-		if (region->to > env->end)
+		if (region->addr[1] < region->addr[0])
 			return -1;
-
-		if (region->to < region->from)
-			return -1;
-	} else {
-		region->to = region->from;
+	} else if (c == ';') {
+		region->addr[0] = env->cur;
+		region->addr[1] = env->end;
+		region->n = 2;
+		stream_getc(s);
 	}
 
 	return 0;
 }
 
 int
-parse_address(Env *env, uintmax_t *addr, Stream *s)
+parse_address(Env *env, Region *region, Stream *s)
 {
+	uintmax_t *addr;
+	uintmax_t n;
+	int sign;
+	int match;
 	int c;
-	int d;
+
+	if (region->n >= 2)
+		return -1;
+
+	addr = region->addr + region->n;
 
 	while (isspace(c = stream_getc(s)))
 		;
 
-	if (isdigit(c)) {
-		*addr = 0;
-		do {
-			*addr = *addr * 10 + (c - '0');
+	*addr = env->cur;
+	match = 0;
+	sign = 0;
+	for (;;) {
+		if (isdigit(c)) {
+			n = 0;
+			do {
+				n = n * 10 + (c - '0');
+				c = stream_getc(s);
+			} while (isdigit(c));
+			if (sign > 0) {
+				*addr += n;
+				if (*addr > env->end)
+					return -1;
+			} else if (sign < 0) {
+				if (n > *addr)
+					return -1;
+				*addr -= n;
+			} else {
+				*addr = n;
+				if (*addr > env->end)
+					return -1;
+			}
+			sign = 0;
+			match = 1;
+		} else if (c == '$') {
+			*addr = env->end;
+			sign = 0;
 			c = stream_getc(s);
-		} while (isdigit(c));
-	} else if (c == '$') {
-		*addr = env->end;
-		stream_getc(s);
-	} else if (c == '.') {
-		*addr = env->cur;
-		stream_getc(s);
-	} else if (c == '-') {
-		d = 0;
-		while (isdigit(c = stream_getc(s)))
-			d = d * 10 + (c - '0');
-		if (d == 0)
-			d = 1;
-		*addr = env->cur - d;
-	} else if (c == '+') {
-		d = 0;
-		while (isdigit(c = stream_getc(s)))
-			d = d * 10 + (c - '0');
-		if (d == 0)
-			d = 1;
-		*addr = env->cur + d;
-	} else {
-		return -1;
+			match = 1;
+		} else if (c == '.') {
+			*addr = env->cur;
+			sign = 0;
+			c = stream_getc(s);
+			match = 1;
+		} else if (c == '-') {
+			sign--;
+			c = stream_getc(s);
+			match = 1;
+		} else if (c == '+') {
+			sign++;
+			c = stream_getc(s);
+			match = 1;
+		} else {
+			break;
+		}
+	}
+
+	if (match) {
+		if (sign < 0 && (uintmax_t)-sign > *addr)
+			return -1;
+		*addr += sign;
+		if (*addr > env->end)
+			return -1;
+		region->n++;
 	}
 
 	return 0;
@@ -259,16 +311,20 @@ cmd_change(Env *env, Region *region, Stream *p)
 {
 	Action *act;
 
+	if (region->n < 1)
+		region->addr[0] = env->cur;
+
 	if ((act = realloc(env->act, sizeof(Action) * (env->nact + 1))) == NULL)
 		return CMD_ERROR;
 	env->act = act;
 	act = env->act + env->nact;
 
-	act->region.from = region->from;
+	act->region.addr[0] = region->addr[0];
 	buf_init(&act->b);
 	if (input_data(&act->b, p, '.') != 0)
 		return CMD_ERROR;
-	act->region.to = region->from + act->b.len - 1;
+	act->region.addr[1] = region->addr[0] + act->b.len - 1;
+	act->region.n = 2;
 
 	env->nact++;
 
@@ -300,11 +356,12 @@ cmd_edit(Env *env, Region *region, Stream *p)
 
 	if (env->end > 0)
 		env->end--;
+	env->cur = env->end;
 
 	return CMD_OK;
 }
 
-/* /search-string */
+/* (0,$)/search-string */
 int
 cmd_search(Env *env, Region *region, Stream *p)
 {
@@ -329,10 +386,16 @@ cmd_search(Env *env, Region *region, Stream *p)
 		return CMD_ERROR;
 	}
 
+	if (region->n < 1)
+		region->addr[0] = 0;
+	if (region->n < 2)
+		region->addr[1] = env->end;
+	region->n = 2;
+
 	t = ptn.c;
 	e = ptn.c + ptn.len;
 	stream_init(&s, fd, NULL);
-	for (i = region->from; i <= region->to; i++) {
+	for (i = region->addr[0]; i <= region->addr[1]; i++) {
 		c = stream_getc(&s);
 		if ((act = action_find(env, i)) != NULL)
 			c = action_at(act, i);
@@ -352,9 +415,6 @@ cmd_search(Env *env, Region *region, Stream *p)
 	buf_free(&ptn);
 	close(fd);
 
-	if (!env->silent)
-		printf("%ju\n", region->to - region->from);
-
 	return CMD_OK;
 }
 
@@ -365,13 +425,19 @@ cmd_print(Env *env, Region *region, Stream *p)
 	Stream s;
 	int fd;
 
+	if (region->n < 1)
+		region->addr[0] = env->cur;
+	if (region->n < 2)
+		region->addr[1] = region->addr[0];
+	region->n = 2;
+
 	if (env->fname.len == 0)
 		return CMD_ERROR;
 
 	if ((fd = open((char *)env->fname.c, O_RDONLY)) == -1)
 		return CMD_ERROR;
 
-	if (lseek(fd, region->from, SEEK_SET) == (off_t)-1) {
+	if (lseek(fd, region->addr[0], SEEK_SET) == (off_t)-1) {
 		close(fd);
 		return CMD_ERROR;
 	}
@@ -381,6 +447,8 @@ cmd_print(Env *env, Region *region, Stream *p)
 	hexdump(env, region, &s);
 
 	close(fd);
+
+	env->cur = region->addr[1];
 
 	return CMD_OK;
 }
@@ -396,6 +464,7 @@ cmd_quit(Env *env, Region *region, Stream *p)
 int
 cmd_write(Env *env, Region *region, Stream *p)
 {
+	uintmax_t total;
 	Action *act;
 	int fd;
 	int i;
@@ -406,9 +475,10 @@ cmd_write(Env *env, Region *region, Stream *p)
 	if ((fd = open((char *)env->fname.c, O_RDWR)) == -1)
 		return CMD_ERROR;
 
+	total = 0;
 	for (i = 0; i < env->nact; i++) {
 		act = env->act + i;
-		if (lseek(fd, act->region.from, SEEK_SET) == (off_t)-1) {
+		if (lseek(fd, act->region.addr[0], SEEK_SET) == (off_t)-1) {
 			close(fd);
 			return CMD_ERROR;
 		}
@@ -416,6 +486,7 @@ cmd_write(Env *env, Region *region, Stream *p)
 			close(fd);
 			return CMD_ERROR;
 		}
+		total += act->b.len;
 	}
 
 	close(fd);
@@ -427,6 +498,21 @@ cmd_write(Env *env, Region *region, Stream *p)
 	free(env->act);
 	env->act = NULL;
 	env->nact = 0;
+
+	if (!env->silent)
+		printf("%ju\n", total);
+
+	return CMD_OK;
+}
+
+/* ($)= */
+int
+cmd_print_addr(Env *env, Region *region, Stream *p)
+{
+	if (region->n < 1)
+		region->addr[0] = env->end;
+
+	printf("%0*jx\n", env->width, region->addr[0]);
 
 	return CMD_OK;
 }
@@ -467,24 +553,24 @@ hexdump(Env *env, Region *region, Stream *s)
 	int c;
 	int over;
 
-	size = region->to + 1;
+	size = region->addr[1] + 1;
 	end = (size + 0xf) & ~0xf;
 	over = 0;
 	p = t;
 	printf("%-*.*s  0  1  2  3  4  5  6  7   8  9  a  b  c  d  e  f\n",
 	       env->width, env->width, "Address");
-	for (i = region->from & ~0xf; i < end; i++) {
+	for (i = region->addr[0] & ~0xf; i < end; i++) {
 		if ((i & 0xf) == 0)
 			printf("%0*jx  ", env->width, i);
 
-		if (!over && i >= region->from && i < size) {
+		if (!over && i >= region->addr[0] && i < size) {
 			if ((c = stream_getc(s)) == EOF)
 				over = 1;
 			if ((act = action_find(env, i)) != NULL)
 				c = action_at(act, i);
 		}
 
-		if (over || i < region->from || i >= size) {
+		if (over || i < region->addr[0] || i >= size) {
 			printf("   ");
 			*p++ = ' ';
 		} else {
@@ -559,7 +645,7 @@ action_find(Env *env, uintmax_t addr)
 
 	for (i = env->nact - 1; i >= 0; i--) {
 		act = env->act + i;
-		if (addr >= act->region.from && addr <= act->region.to)
+		if (addr >= act->region.addr[0] && addr <= act->region.addr[1])
 			return act;
 	}
 
@@ -571,7 +657,7 @@ action_at(Action *act, uintmax_t addr)
 {
 	uintmax_t offset;
 
-	if ((offset = addr - act->region.from) >= (uintmax_t)act->b.len)
+	if ((offset = addr - act->region.addr[0]) >= (uintmax_t)act->b.len)
 		return -1;
 
 	return act->b.c[offset] & 0xff;
